@@ -1,20 +1,11 @@
 import matplotlib.pyplot as plt
-import os, argparse, re
+import os, argparse, re, json
 from rawfile import RawFile
 
-if __name__ == "__main__":
-    argParser = argparse.ArgumentParser()
-    argParser.add_argument("-c", "--circuit", help="Circuit file")
-    argParser.add_argument("-s", "--spice", help="Spice")
-    argParser.add_argument("--save", help="Save plot to file", action="store_true")
+TMP_FILE = "__tmp.sp"
 
-    config = argParser.parse_args()
-    if config.spice:
-        config.spice = config.spice.replace("\\n", "\n")
-        with open("tmp.sp", "w", encoding="utf-8") as file:
-            file.write(config.spice)
-        config.circuit = "tmp.sp"
 
+def transient_analysis(config):
     os.system("ngspice -b -r test.raw " + config.circuit)
     rawFile = RawFile("test.raw")
     rawFile.open()
@@ -31,9 +22,6 @@ if __name__ == "__main__":
             if match:
                 vars.append(match.group(1).lower())
     curves = rawFile.get_curve_data(vars)
-
-    if os.path.exists("tmp.sp"):
-        os.remove("tmp.sp")
 
     if len(curves) > 0:
         figure, axes = plt.subplots(len(curves))
@@ -104,3 +92,89 @@ if __name__ == "__main__":
             plt.show()
     else:
         print("No curves to show.")
+
+
+def op_analysis(config):
+    user_require_variables = []
+    with open(config.circuit, "r", encoding="utf-8") as file:
+        lines = file.readlines()
+        for line in lines:
+            if line.lower().startswith(".print") or line.lower().startswith("print"):
+                match = re.match(r"print\s+(.*)", line.lower())
+                if match:
+                    user_require_variables += match.group(1).split()
+
+    with open(TMP_FILE, "w", encoding="utf-8") as file:
+        for line in lines:
+            file.write(line)
+            if line.lower().startswith(".op") or line.lower().startswith("op"):
+                file.write("\nprint allv\n")
+    config.circuit = TMP_FILE
+
+    os.system("ngspice -b -o output.txt " + config.circuit)
+
+    result = {}
+    with open("output.txt", "r", encoding="utf-8") as file:
+        for line in file:
+            # 如果这一行的格式是aaa = bbb，其中aaa是包含字母、数字、下划线、圆括号的字符串，bbb由数字、小数点、e、+、-组成
+            if re.match(r"^[\w\(\),]+\s*=\s*[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?$", line):
+                # print(line, end="")
+                match = re.match(r"^([\w\(\),]+)\s*=\s*([-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?)$", line)
+                if match:
+                    variable = match.group(1)
+                    value = float(match.group(2))
+                    if value.is_integer():
+                        value = int(value)
+                    # 如果variable被i(xx)或v(xx)包围，去掉括号和括号前面的i/v
+                    if variable in user_require_variables:
+                        result[("I" if variable[0] == "i" else "U") + str(user_require_variables.index(variable))] = (
+                            str(value) + ("A" if variable[0] == "i" else "V")
+                        )
+                    else:
+                        match = re.match(r"([iv])\((.*)\)", variable)
+                        if match:
+                            variable = match.group(2)
+                            result[variable] = str(value) + ("A" if match.group(1) == "i" else "V")
+                        else:
+                            result[variable] = str(value) + "V"
+
+    os.remove("output.txt")
+
+    with open(config.output, "w", encoding="utf-8") as file:
+        file.write(json.dumps(result, indent=4))
+
+
+TYPE = None
+
+if __name__ == "__main__":
+    argParser = argparse.ArgumentParser()
+    argParser.add_argument("-c", "--circuit", help="Circuit file")
+    argParser.add_argument("-s", "--spice", help="Spice")
+    argParser.add_argument("--save", help="Save plot to file", action="store_true")
+    argParser.add_argument("-o", "--output", help="Output file", default="output.json")
+
+    config = argParser.parse_args()
+    if config.spice:
+        config.spice = config.spice.replace("\\n", "\n")
+        with open(TMP_FILE, "w", encoding="utf-8") as file:
+            file.write(config.spice)
+        config.circuit = TMP_FILE
+
+    with open(config.circuit, "r", encoding="utf-8") as file:
+        for line in file:
+            if line.lower().startswith(".tran"):
+                TYPE = "TRAN"
+                break
+            if line.lower().startswith(".op") or line.lower().startswith("op"):
+                TYPE = "OP"
+                break
+
+    if TYPE == "TRAN":
+        transient_analysis(config)
+    elif TYPE == "OP":
+        op_analysis(config)
+    else:
+        print("No analysis found.")
+
+    if os.path.exists(TMP_FILE):
+        os.remove(TMP_FILE)
